@@ -1,0 +1,16 @@
+[project]
+name = "hodu-maru"
+version = "0.1.0"
+description = "Maru(xcena-dev/maru)를 공부하려고 만드는 미니 Maru"
+requires-python = ">=3.13"
+dependencies = ["pyzmq", "msgpack"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hodu_maru"]
