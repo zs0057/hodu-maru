@@ -100,6 +100,12 @@ class MaruHandler:
         self._shm.free(self._owned_handle)
         self._owned_handle = None
 
+        # 3b) 남의 영역 창도 전부 닫기 (4.2b). retrieve에서 붙은 창(producer 영역)이 _mmap_cache에 남아 있으면
+        #     프로세스가 끝날 때 SharedMemory.__del__이 닫으려다 BufferError ("Exception ignored")
+        #     munmap이 조각이 남은 창은 미뤄 준다 ("deferred to GC", 1.7)
+        #     진짜: handler.close 3단계 "Unmap all regions (owned + shared)"
+        self._shm.close()
+
         # 4) 서버 연결 닫기. 진짜는 서버에 연결 해제를 알려 내 영역을 돌려준다 (지연 해제, 6장)
         self._rpc.close()
 
@@ -171,8 +177,29 @@ class MaruHandler:
         return True  # 진짜와 같이: 이미 있던 키도 "저장됨" (같은 키 = 같은 내용)
 
     def retrieve(self, key: str) -> MemoryInfo | None:
-        """서버에 위치를 묻고, 그 영역에 붙어서 복사 없이 읽을 창(view)을 돌려준다."""
-        raise NotImplementedError("4장 retrieve: 위치 조회 + 남의 영역에 붙기")
+        """서버에 위치를 묻고, 그 영역에 붙어서 복사 없이 읽을 창(view)을 돌려준다 (4.1).
+
+        진짜: handler.py retrieve (709~800줄)
+        주의 (진짜 docstring과 같음): 돌려준 view는 영역이 열려 있는 동안만 유효하다. close() 뒤에는 쓰지 말 것
+        """
+        # 1) 서버에 "이 키 어디 있어?" → 소켓으로 오가는 건 위치(수백 바이트)뿐, 데이터는 안 온다
+        result = self._rpc.lookup_kv(key)
+        if result is None:
+            return None  # 없는 키 → consumer.py가 "key=… not found" 출력
+
+        # 2) 그 영역의 창. 진짜는 is_owned로 먼저 갈라서 남의 영역일 때만 map_region을 하지만,
+        #    호두마루 mmap은 두 길이라 확인 없이 불러도 된다 (1.7)
+        #      ① 캐시에 있으면 그 창 (내 영역 = alloc이 넣어 둔 창, 또는 이미 붙은 남의 영역)
+        #      ② 없으면 이름으로 붙기 (남의 영역 처음, track=False)
+        handle = result["handle"]  # MaruHandle (3.4 lookup_kv에서 from_dict로 바꿔 둔 것)
+        region_buf = self._shm.mmap(handle)  # 영역 전체 창 (100MB)
+
+        # 3) 키 하나만큼 자르기. 시작 = 장부의 kv_offset (Page 번호 × chunk_size, 3.5 store에서 적은 값)
+        #    [:kv_length]로 자르면 시작이 늘 0 → 모든 키가 Page 0 (key=1001의 'A')을 읽는다
+        #    진짜: get_buffer_view(region_id, result.kv_offset, result.kv_length)
+        kv_offset = result["kv_offset"]
+        view = region_buf[kv_offset : kv_offset + result["kv_length"]]
+        return MemoryInfo(view=view)
 
     # ---- with 문 (진짜와 동일) -----------------------------------------------
 

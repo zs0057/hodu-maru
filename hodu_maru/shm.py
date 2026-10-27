@@ -65,3 +65,12 @@ class MaruShmClient:
             # mmap을 SharedMemory에서 떼어 내면, 조각이 사라질 때 mmap이 스스로 풀린다 (진짜는 날것의 mmap을 들고 있어서 원래 이렇게 동작)
             shm._mmap = None
             shm.close()  # 남은 fd만 닫는다
+
+    def close(self) -> None:
+        """열린 창을 전부 닫는다 (내 영역 + 남의 영역). 진짜: maru_shm/client.py close()
+
+        진짜 docstring: "Close persistent connection and all cached mmaps."
+        free가 아니라 munmap: 남의 영역은 내가 지울 권리가 없다 (주인만 free, 1.5 close ≠ unlink)
+        """
+        for region_id in list(self._mmap_cache):  # list(): 돌면서 dict에서 빼므로 복사본으로 돈다
+            self.munmap(MaruHandle(region_id=region_id))  # munmap은 region_id만 쓴다
