@@ -4,6 +4,7 @@
 몸통은 장마다 같이 채운다. NotImplementedError 메시지가 "다음에 만들 것"이다.
 """
 
+from hodu_maru.allocator import PagedMemoryAllocator
 from hodu_maru.config import MaruConfig
 from hodu_maru.shm import MaruShmClient
 from hodu_maru.types import AllocHandle, MaruHandle, MemoryInfo
@@ -25,6 +26,10 @@ class MaruHandler:
         self._owned_handle: MaruHandle | None = None
         self._owned_buf: memoryview | None = None
 
+        # 내 영역을 마루 Page(chunk_size_bytes)로 나눠 번호를 빌려주는 할당기 (2장). connect()에서 만든다
+        #   진짜: OwnedRegionManager가 영역마다 PagedMemoryAllocator를 하나씩 들고 있다 (영역이 하나뿐이라 바로 들고 있음)
+        self._allocator: PagedMemoryAllocator | None = None
+
     # ---- 연결 / 종료 ---------------------------------------------------------
 
     def connect(self) -> bool:
@@ -45,6 +50,15 @@ class MaruHandler:
         #    (mmap의 ① 캐시 길 → 내 영역에 창을 두 번 열지 않음, 1.7)
         self._owned_buf = self._shm.mmap(self._owned_handle)
 
+        # ① 내 영역을 Page로 나누기 (2.4). 진짜: owned_region_manager.py 79~85줄 (map 직후)
+        #    pool_size는 요청한 크기(config.pool_size)가 아니라 실제로 받은 크기(handle.length)
+        #    예: 1000 요청 → 16384 받음(1.2). 요청 크기로 나누면 1000 // 1024 = 0개, 받은 크기면 16개
+        self._allocator = PagedMemoryAllocator(
+            region_id=self._owned_handle.region_id,
+            pool_size=self._owned_handle.length,
+            chunk_size=self._config.chunk_size_bytes,
+        )
+
         # ② 서버 연결: 3장에서 여기에 추가
 
         self._connected = True
@@ -54,7 +68,11 @@ class MaruHandler:
         """진짜: 서버에 연결 해제 알림 + 영역 unmap."""
         if not self._connected:
             return
-        
+
+        # 0) Page 번호 기록 지우기. 할당기는 번호만 관리하고 메모리는 안 건드린다 (메모리는 아래 1)~3))
+        self._allocator.close()
+        self._allocator = None
+
         # 1) 내가 들고 있던 창을 반납한다.
         #    빌려 간 조각이 남아 있으면 창을 닫을 수 없다 (1.7 BufferError)
         #    진짜: memory/mapper.py unmap_region의 region.release()
@@ -75,8 +93,37 @@ class MaruHandler:
     # ---- 데이터 경로 ---------------------------------------------------------
 
     def alloc(self, size: int) -> AllocHandle:
-        """내 영역에서 페이지 하나를 빌려, 쓰기 가능한 창(buf)을 돌려준다."""
-        raise NotImplementedError("2장 PagedMemoryAllocator: 페이지 할당기")
+        """내 영역에서 페이지 하나를 빌려, 쓰기 가능한 창(buf)을 돌려준다.
+
+        진짜: handler.py alloc (528~558줄). MaruShmClient.alloc(영역 받기)과 다른 층: 이건 Page 한 칸 빌리기
+        """
+        chunk_size = self._config.chunk_size_bytes
+
+        # 1) 입구에서 막기: Page보다 큰 데이터는 넘친다 (2.1)
+        if size > chunk_size:
+            raise ValueError(f"Requested size {size} exceeds chunk_size {chunk_size}")
+
+        # 2) Page 번호 빌리기. None = 다 떨어짐 → 어떻게 할지는 여기서 정한다 (2.2)
+        #    진짜는 _expand_region()으로 영역을 하나 더 받아 본 뒤 안 되면 에러 (7장). 호두마루는 영역 1개라 바로 에러
+        page_index = self._allocator.allocate()
+        if page_index is None:
+            raise ValueError("Cannot allocate page: pool exhausted")
+
+        # 3) 번호 → 영역 안 위치. MaruHandle.offset(영역 시작, 항상 0)과 다른 층의 offset
+        #    0으로 고정하면 모든 키가 맨 앞 1MB를 덮어쓴다
+        offset = page_index * chunk_size
+
+        # 4) 창은 size만큼만. Page는 통째로 빌리지만, chunk_size로 자르면 작은 데이터에서
+        #    buf[:] = data가 ValueError (2.4 실험: b[4:8][:] = b"AB")
+        #    진짜: get_buffer_view(region_id, page_index * chunk_size, size)
+        buf = self._owned_buf[offset : offset + size]
+
+        return AllocHandle(
+            buf=buf,
+            region_id=self._owned_handle.region_id,
+            page_index=page_index,
+            size=size,
+        )
 
     def store(self, key: str, handle: AllocHandle) -> bool:
         """데이터는 이미 handle.buf에 써져 있다. 서버에 '키 → 위치'만 등록한다.
