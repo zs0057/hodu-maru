@@ -6,6 +6,7 @@
 
 from hodu_maru.allocator import PagedMemoryAllocator
 from hodu_maru.config import MaruConfig
+from hodu_maru.rpc_client import RpcClient
 from hodu_maru.shm import MaruShmClient
 from hodu_maru.types import AllocHandle, MaruHandle, MemoryInfo
 
@@ -29,6 +30,10 @@ class MaruHandler:
         # 내 영역을 마루 Page(chunk_size_bytes)로 나눠 번호를 빌려주는 할당기 (2장). connect()에서 만든다
         #   진짜: OwnedRegionManager가 영역마다 PagedMemoryAllocator를 하나씩 들고 있다 (영역이 하나뿐이라 바로 들고 있음)
         self._allocator: PagedMemoryAllocator | None = None
+
+        # 메타데이터 서버와 이야기하는 창구 (3.4). 진짜: self._rpc = self._make_rpc(server_url)
+        #   데이터는 공유 메모리로 직접, 서버에는 위치만 보낸다 ("Metadata traveled, data didn't")
+        self._rpc = RpcClient(self._config.server_url, timeout_ms=self._config.timeout_ms)
 
     # ---- 연결 / 종료 ---------------------------------------------------------
 
@@ -59,7 +64,13 @@ class MaruHandler:
             chunk_size=self._config.chunk_size_bytes,
         )
 
-        # ② 서버 연결: 3장에서 여기에 추가
+        # ② 서버 연결 + 내 영역 알려 주기 (3.5). 영역 핸들은 connect 때 한 번, 키는 store마다 (3.3)
+        #    진짜는 서버가 영역을 나눠 주는 쪽(request_alloc)이라 원래 안다.
+        #    호두마루는 Resource Manager가 없어서 producer가 알려 준다 (REGISTER_REGION 0x01)
+        #    ZMQ connect는 예약만 해서 서버가 꺼져 있어도 여기선 에러가 안 난다
+        #    → register_region에서 timeout → ConnectionError (3.4)
+        self._rpc.connect()
+        self._rpc.register_region(self._owned_handle)
 
         self._connected = True
         return True
@@ -88,6 +99,9 @@ class MaruHandler:
         #    원래 창(track=True, 뒷정리 도우미가 지켜보는 쪽)으로 unlink한다 (1.7)
         self._shm.free(self._owned_handle)
         self._owned_handle = None
+
+        # 4) 서버 연결 닫기. 진짜는 서버에 연결 해제를 알려 내 영역을 돌려준다 (지연 해제, 6장)
+        self._rpc.close()
 
         self._connected = False
     # ---- 데이터 경로 ---------------------------------------------------------
@@ -126,11 +140,35 @@ class MaruHandler:
         )
 
     def store(self, key: str, handle: AllocHandle) -> bool:
-        """데이터는 이미 handle.buf에 써져 있다. 서버에 '키 → 위치'만 등록한다.
+        """데이터는 이미 handle.buf에 써져 있다. 서버에 '키 → 위치'만 등록한다 (3.5).
 
-        메모: 진짜 시그니처는 key: str인데 예제는 1001(int)을 넘긴다. 3장에서 짚기.
+        진짜: handler.py store (621~708줄). 진짜의 로컬 중복 확인(_key_to_location)과
+        exists_kv로 먼저 묻기는 뺐다 (서버의 "먼저 등록한 쪽이 이김"만으로 결과는 같다)
+
+        key: 진짜 시그니처는 str인데 예제는 1001(int)을 넘긴다 → 그대로 보낸다 (진짜도 바꾸지 않음).
+             msgpack·dict는 int도 받는다. 대신 producer와 consumer가 같은 타입을 써야 같은 키가 된다
         """
-        raise NotImplementedError("3장 KVManager · MaruServer: 서버에 등록")
+        # 장부에 적을 위치: Page 번호 → 영역 안 위치 (2.4 alloc과 같은 계산)
+        kv_offset = handle.page_index * self._config.chunk_size_bytes
+
+        try:
+            is_new = self._rpc.register_kv(
+                key=key,
+                region_id=handle.region_id,
+                kv_offset=kv_offset,
+                kv_length=handle.size,  # 키마다 다른 길이 → 핸들이 아니라 장부에 (1.6)
+            )
+        except ConnectionError:
+            # 등록 못 함 (서버 꺼짐 → timeout, 3.4) → 아무도 이 Page를 찾을 수 없으니 돌려준다
+            self._allocator.free(handle.page_index)
+            return False
+
+        if not is_new:
+            # 같은 키를 다른 producer가 먼저 등록함 (먼저 등록한 쪽이 이김, 3.1)
+            # 내 Page는 장부에 없는 복사본 → 안 돌려주면 Page 누수
+            # 진짜: "key=%s lost register race, freed page" (PR #94가 배치 버전에서 고친 것)
+            self._allocator.free(handle.page_index)
+        return True  # 진짜와 같이: 이미 있던 키도 "저장됨" (같은 키 = 같은 내용)
 
     def retrieve(self, key: str) -> MemoryInfo | None:
         """서버에 위치를 묻고, 그 영역에 붙어서 복사 없이 읽을 창(view)을 돌려준다."""

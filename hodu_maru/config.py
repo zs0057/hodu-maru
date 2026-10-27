@@ -14,3 +14,4 @@ class MaruConfig:
     pool_size: int = 1024 * 1024 * 100  # 내 영역 크기 (100MB)
     chunk_size_bytes: int = 1024 * 1024  # 페이지 1개 크기 (1MB)
     auto_connect: bool = True  # with 문에 들어갈 때 connect()를 부를지
+    timeout_ms: int = 2000  # 서버 답을 기다리는 시간 (밀리초, 진짜 기본값과 같음, 3.4)

@@ -1,4 +1,6 @@
-"""AllocHandle, MemoryInfo — 진짜: maru_handler/memory/types.py"""
+"""MaruHandle — 진짜: maru_shm/types.py
+AllocHandle, MemoryInfo — 진짜: maru_handler/memory/types.py
+"""
 
 from dataclasses import dataclass
 
@@ -10,6 +12,17 @@ class MaruHandle:
     offset: int = 0   # 공유 메모리 안에서 영역이 시작하는 위치. 공유 메모리 1개 = 영역 1개라 항상 0 (진짜 FS_DAX와 같음)
     length: int = 0   # 영역 전체 크기 (OS 페이지 단위로 올림). 키별 데이터 길이는 서버 장부의 kv_length
     # auth_token 없음: 이름만 알면 누구나 붙어서 읽고 쓸 수 있다 (접근 제어 포기, 학습용 맥 1대라서)
+
+    # msgpack은 dict·str·int 같은 기본 타입만 안다 → 소켓으로 보낼 땐 dict로 바꾼다 (3.3)
+    #   서버: MaruHandle → to_dict() → dict → packb → bytes ──소켓──▶
+    #   클라: bytes → unpackb → dict → from_dict() → MaruHandle → mmap(handle)
+    # 진짜도 같은 이름 (maru_shm/types.py). 호두마루는 auth_token 없이 3칸
+    def to_dict(self) -> dict:
+        return {"region_id": self.region_id, "offset": self.offset, "length": self.length}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MaruHandle":
+        return cls(region_id=d["region_id"], offset=d.get("offset", 0), length=d.get("length", 0))
 
 @dataclass(eq=False)
 class AllocHandle:
