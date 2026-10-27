@@ -25,6 +25,10 @@ class RpcClient:
         self._timeout_ms = timeout_ms  # 서버가 답을 안 할 때 얼마나 기다릴지 (밀리초, 진짜 기본값도 5000)
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
+        # 소켓으로 오간 바이트 (4.3). msgpack으로 바꾼 뒤의 bytes 길이 = 실제로 소켓에 실린 메시지 크기
+        #   (ZMQ가 붙이는 프레임 머리 몇 바이트·연결 인사는 안 셈)
+        self.bytes_sent = 0
+        self.bytes_recv = 0
 
     def connect(self) -> None:
         """서버에 연결. ZMQ의 connect는 '여기로 연결해 둬'라고 예약만 하고 바로 돌아온다 (3.4 실험)"""
@@ -48,7 +52,9 @@ class RpcClient:
         → 정해진 시간만 기다리고, 넘으면 포기하고 소켓을 새로 만든다
         """
         request = {"msg_type": msg_type, **data}  # 번호와 내용을 dict 하나로 (서버가 req["msg_type"]으로 읽음)
-        self._socket.send(msgpack.packb(request))  # ① dict → bytes → 보내기 (내 쪽 대기열에 넣기만, 멈추지 않음)
+        payload = msgpack.packb(request)  # ① dict → bytes
+        self.bytes_sent += len(payload)  # 4.3: 소켓에 실리는 건 bytes. len(request)는 dict 칸 수라 바이트가 아니다
+        self._socket.send(payload)  # 보내기 (내 쪽 대기열에 넣기만, 멈추지 않음)
 
         poller = zmq.Poller()
         poller.register(self._socket, zmq.POLLIN)  # "이 소켓에 받을 게 오면 알려 줘"
@@ -60,7 +66,9 @@ class RpcClient:
             self._reset_socket()
             return {"error": "timeout", "success": False}  # 진짜와 같은 모양 → register_kv가 ConnectionError로 바꿈
 
-        return msgpack.unpackb(self._socket.recv(zmq.NOBLOCK))  # ② 답이 이미 와 있으니 recv가 멈추지 않음
+        raw = self._socket.recv(zmq.NOBLOCK)  # ② 답이 이미 와 있으니 recv가 멈추지 않음
+        self.bytes_recv += len(raw)  # 4.3: 소켓으로 들어온 바이트
+        return msgpack.unpackb(raw)
 
     def _reset_socket(self) -> None:
         """갇힌 REQ 소켓을 버리고 새로 만든다. 진짜 주석: "REQ socket needs reset after timeout"

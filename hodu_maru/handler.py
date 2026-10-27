@@ -4,11 +4,16 @@
 몸통은 장마다 같이 채운다. NotImplementedError 메시지가 "다음에 만들 것"이다.
 """
 
+import logging
+
 from hodu_maru.allocator import PagedMemoryAllocator
 from hodu_maru.config import MaruConfig
 from hodu_maru.rpc_client import RpcClient
 from hodu_maru.shm import MaruShmClient
 from hodu_maru.types import AllocHandle, MaruHandle, MemoryInfo
+
+# 진짜도 handler.py 맨 위에 같은 줄. 예제가 basicConfig(level=INFO)를 켜 둬서 예제 머리말([Producer]/[Consumer])로 찍힌다
+logger = logging.getLogger(__name__)
 
 
 class MaruHandler:
@@ -34,6 +39,10 @@ class MaruHandler:
         # 메타데이터 서버와 이야기하는 창구 (3.4). 진짜: self._rpc = self._make_rpc(server_url)
         #   데이터는 공유 메모리로 직접, 서버에는 위치만 보낸다 ("Metadata traveled, data didn't")
         self._rpc = RpcClient(self._config.server_url, timeout_ms=self._config.timeout_ms)
+
+        # 공유 메모리로 오간 데이터 바이트 (4.3): store한 크기(producer) + retrieve한 view 길이(consumer)
+        #   소켓 바이트(self._rpc.bytes_sent/recv)와 나란히 찍어서 "Metadata traveled, data didn't"를 숫자로
+        self._data_bytes = 0
 
     # ---- 연결 / 종료 ---------------------------------------------------------
 
@@ -106,6 +115,13 @@ class MaruHandler:
         #     진짜: handler.close 3단계 "Unmap all regions (owned + shared)"
         self._shm.close()
 
+        # 3c) 4.3 측정 결과: 소켓으로 오간 바이트 vs 공유 메모리로 오간 데이터 바이트
+        sent, recv = self._rpc.bytes_sent, self._rpc.bytes_recv
+        logger.info(
+            "Metadata traveled, data didn't — socket %d bytes (sent %d + recv %d), shared memory data %d bytes",
+            sent + recv, sent, recv, self._data_bytes,
+        )
+
         # 4) 서버 연결 닫기. 진짜는 서버에 연결 해제를 알려 내 영역을 돌려준다 (지연 해제, 6장)
         self._rpc.close()
 
@@ -174,6 +190,7 @@ class MaruHandler:
             # 내 Page는 장부에 없는 복사본 → 안 돌려주면 Page 누수
             # 진짜: "key=%s lost register race, freed page" (PR #94가 배치 버전에서 고친 것)
             self._allocator.free(handle.page_index)
+        self._data_bytes += handle.size  # 4.3: 데이터는 이미 handle.buf로 공유 메모리에 써졌다 (소켓 X)
         return True  # 진짜와 같이: 이미 있던 키도 "저장됨" (같은 키 = 같은 내용)
 
     def retrieve(self, key: str) -> MemoryInfo | None:
@@ -199,6 +216,7 @@ class MaruHandler:
         #    진짜: get_buffer_view(region_id, result.kv_offset, result.kv_length)
         kv_offset = result["kv_offset"]
         view = region_buf[kv_offset : kv_offset + result["kv_length"]]
+        self._data_bytes += len(view)  # 4.3: 복사 없이 넘겨준 데이터 크기 (소켓 X)
         return MemoryInfo(view=view)
 
     # ---- with 문 (진짜와 동일) -----------------------------------------------
